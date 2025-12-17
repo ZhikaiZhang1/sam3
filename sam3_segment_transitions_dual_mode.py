@@ -23,6 +23,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+
 # add your HF token and proxy here if needed
 
 def to_cpu_numpy(x):
@@ -101,7 +102,10 @@ def write_mp4(frames_rgb, out_path, fps=30):
             fr = np.repeat(fr[:, :, None], 3, axis=2)
         if fr.shape[2] == 4:
             fr = fr[:, :, :3]
-        bgr = fr[:, :, ::-1]  # RGB->BGR
+        # bgr = fr[:, :, ::-1]  # RGB->BGR
+        # vw.write(bgr)
+        fr = np.ascontiguousarray(fr)
+        bgr = np.ascontiguousarray(fr[..., ::-1])   # <— KEY: avoid negative-stride view
         vw.write(bgr)
 
     vw.release()
@@ -267,31 +271,12 @@ class Sam3ImageSegmenter:
         from tqdm import tqdm
 
         def _run_tqdm_timer(pbar: tqdm, t0: float, stop_evt: threading.Event, every_s: float = 0.2):
-            # refresh the same tqdm line periodically (no extra prints)
             while not stop_evt.is_set():
-                # elapsed_min = (time.time() - t0) / 60.0
-                # pbar.set_postfix_str(f"elapsed={elapsed_min:.2f} min", refresh=False)
                 pbar.refresh()
                 stop_evt.wait(every_s)
 
         if isinstance(prompts, str):
             prompts = [prompts]
-
-        # Normalize visual prompt dict so frame indices are ints (JSON often loads them as strings)
-        if visual_prompts is not None:
-            vp_norm: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
-            for p, by_f in visual_prompts.items():
-                if by_f is None:
-                    continue
-                inner: Dict[int, List[Dict[str, Any]]] = {}
-                for k, v in by_f.items():
-                    try:
-                        ki = int(k)
-                    except Exception:
-                        continue
-                    inner[ki] = list(v) if v is not None else []
-                vp_norm[str(p)] = inner
-            visual_prompts = vp_norm
 
         H, W = frames_rgb_u8[0].shape[:2]
         out_masks: List[np.ndarray] = []
@@ -305,8 +290,39 @@ class Sam3ImageSegmenter:
         timer_th = threading.Thread(target=_run_tqdm_timer, args=(pbar, t0, stop_evt, 0.2), daemon=True)
         timer_th.start()
 
+        # Normalize visual_prompts keys: accept int or str frame keys
+        vp = visual_prompts or {}
+
+        def _get_boxes(prompt: str, frame_idx: int):
+            d = vp.get(prompt)
+            if not d:
+                return []
+            if frame_idx in d:
+                return d[frame_idx] or []
+            sk = str(frame_idx)
+            if sk in d:
+                return d[sk] or []
+            return []
+
+        def _xywh_to_norm_cxcywh(xywh, w: int, h: int):
+            x, y, bw, bh = [float(v) for v in xywh]
+            cx = x + bw * 0.5
+            cy = y + bh * 0.5
+            # normalize
+            if w <= 0 or h <= 0:
+                return [0.0, 0.0, 0.0, 0.0]
+            nx = cx / float(w)
+            ny = cy / float(h)
+            nw = bw / float(w)
+            nh = bh / float(h)
+            # clamp
+            nx = min(max(nx, 0.0), 1.0)
+            ny = min(max(ny, 0.0), 1.0)
+            nw = min(max(nw, 0.0), 1.0)
+            nh = min(max(nh, 0.0), 1.0)
+            return [nx, ny, nw, nh]
+
         try:
-            # iterate “micro-batches” but still do set_image per-frame (SAM3 API limitation)
             for s in pbar:
                 e = min(s + batch_size, n)
                 chunk = frames_rgb_u8[s:e]
@@ -318,41 +334,33 @@ class Sam3ImageSegmenter:
                         else torch.no_grad()
                     )
                     with amp_ctx:
-                        for local_i, fr in enumerate(chunk):
-                            global_i = int(s + local_i)
-                            # set_image accepts PIL or tensor. PIL is simplest & matches README.
+                        for j, fr in enumerate(chunk):
+                            frame_idx = s + j
                             state = self.processor.set_image(Image.fromarray(fr))
 
-                            def _xywh_to_norm_cxcywh(xywh):
-                                x, y, bw, bh = [float(v) for v in xywh]
-                                cx = x + 0.5 * bw
-                                cy = y + 0.5 * bh
-                                # SAM3 expects normalized cx,cy,w,h in [0,1]
-                                return [cx / float(W), cy / float(H), bw / float(W), bh / float(H)]
-
                             union = np.zeros((H, W), dtype=np.uint8)
+
                             for p in prompts:
-                                # Ensure prompts don't accumulate across objects
-                                if hasattr(self.processor, "reset_all_prompts"):
-                                    self.processor.reset_all_prompts(state)
+                                # Build prompts for this concept
+                                self.processor.reset_all_prompts(state)
+                                state = self.processor.set_text_prompt(state=state, prompt=p)
 
-                                output_state = self.processor.set_text_prompt(state=state, prompt=p)
-
-                                # Optional: add visual exemplar boxes for this (prompt, frame)
-                                if visual_prompts is not None:
-                                    boxes = visual_prompts.get(p, {}).get(global_i, [])
+                                boxes = _get_boxes(p, frame_idx)
+                                if boxes:
                                     for b in boxes:
-                                        xywh = b.get("xywh", None)
-                                        label = bool(b.get("label", True))
-                                        if xywh is None:
+                                        xywh = b.get("xywh") if isinstance(b, dict) else None
+                                        label = b.get("label") if isinstance(b, dict) else None
+                                        if xywh is None or label is None:
                                             continue
-                                        norm_box = _xywh_to_norm_cxcywh(xywh)
-                                        output_state = self.processor.add_geometric_prompt(
-                                            state=output_state, box=norm_box, label=label
+                                        norm_box = _xywh_to_norm_cxcywh(xywh, W, H)
+                                        state = self.processor.add_geometric_prompt(
+                                            state=state,
+                                            box=norm_box,
+                                            label=bool(label),
                                         )
 
                                 m = choose_mask_from_output(
-                                    output_state, h=H, w=W, score_thresh=score_thresh, fallback="zeros"
+                                    state, h=H, w=W, score_thresh=score_thresh, fallback="zeros"
                                 )
                                 union = np.maximum(union, m)
 
@@ -370,6 +378,108 @@ def parse_prompts(prompt: str) -> List[str]:
     """
     parts = [p.strip() for p in prompt.split("|")]
     return [p for p in parts if p]
+
+
+def parse_ui_frames(spec: str) -> List[int]:
+    spec = (spec or '').strip()
+    if not spec:
+        return [0]
+    # Accept formats:
+    #   "0,10,20"
+    #   "0-100:5"  (inclusive range)
+    #   "0:100:5"  (python-like, end exclusive)
+    out: List[int] = []
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        # 0-100:5
+        m = re.match(r"^(\d+)-(\d+)(?::(\d+))?$", part)
+        if m:
+            a = int(m.group(1)); b = int(m.group(2)); step = int(m.group(3) or 1)
+            if step <= 0:
+                step = 1
+            if b < a:
+                a, b = b, a
+            out.extend(list(range(a, b + 1, step)))
+            continue
+        # 0:100:5
+        m = re.match(r"^(\d+):(\d+)(?::(\d+))?$", part)
+        if m:
+            a = int(m.group(1)); b = int(m.group(2)); step = int(m.group(3) or 1)
+            if step <= 0:
+                step = 1
+            out.extend(list(range(a, b, step)))
+            continue
+        # plain int
+        if part.isdigit():
+            out.append(int(part))
+            continue
+        raise ValueError(f"Bad --ui_frames token: '{part}'")
+    if not out:
+        out = [0]
+    # de-dup while preserving order
+    seen=set(); out2=[]
+    for x in out:
+        if x not in seen:
+            out2.append(x); seen.add(x)
+    return out2
+
+
+def clamp_frame_indices(idxs: List[int], n_frames: int) -> List[int]:
+    if n_frames <= 0:
+        return [0]
+    out=[]
+    for i in idxs:
+        ii = int(i)
+        if ii < 0:
+            ii = 0
+        if ii >= n_frames:
+            ii = n_frames - 1
+        out.append(ii)
+    # de-dup preserve order
+    seen=set(); out2=[]
+    for x in out:
+        if x not in seen:
+            out2.append(x); seen.add(x)
+    return out2
+
+
+class VisualPromptStore:
+    # One JSON file for the whole run.
+    def __init__(self, json_path: str):
+        self.json_path = json_path
+        self.data = {"version": 1, "items": {}}  # key -> annotations
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r') as f:
+                    self.data = json.load(f)
+            except Exception:
+                # keep empty if corrupted
+                self.data = {"version": 1, "items": {}}
+
+        if "items" not in self.data or not isinstance(self.data["items"], dict):
+            self.data["items"] = {}
+
+    def make_key(self, pkl_path: str, cam_key: str) -> str:
+        return f"{os.path.abspath(pkl_path)}::{cam_key}"
+
+    def has(self, key: str) -> bool:
+        return key in self.data["items"]
+
+    def get(self, key: str):
+        return self.data["items"].get(key)
+
+    def set(self, key: str, ann: dict):
+        self.data["items"][key] = ann
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.json_path), exist_ok=True)
+        tmp = self.json_path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(self.data, f, indent=2)
+        os.replace(tmp, self.json_path)
+
 
 
 def parse_frame_indices(spec: str) -> List[int]:
@@ -895,6 +1005,7 @@ def segment_video_with_sam3_video_predictor(
 # -------------------------
 # Main pipeline
 # -------------------------
+
 def process_one_pkl(
     pkl_path: str,
     out_root: str,
@@ -905,11 +1016,13 @@ def process_one_pkl(
     overwrite_pkls: bool,
     use_video_predictor: bool,
     score_thresh: float,
-    prompt_mode: str = "text_only",  # "text_only" or "text_visual"
+    prompt_mode: str = "text_only",
     ui_frame_indices: Optional[List[int]] = None,
     visual_prompts_dir: Optional[str] = None,
     overwrite_visual_prompts: bool = False,
-    sam3_segmenter: Optional[Sam3ImageSegmenter] = None,   # NEW
+    visual_ref_pkl: Optional[str] = None,
+    vp_store: Optional[VisualPromptStore] = None,
+    sam3_segmenter: Optional[Sam3ImageSegmenter] = None,
     batch_size=1024,
     video_predictor=None,
     num_chunks=4,
@@ -938,56 +1051,81 @@ def process_one_pkl(
     if prompt_mode == "text_visual" and use_video_predictor:
         raise ValueError("prompt_mode=text_visual is supported for image-per-frame only (disable --use_video_predictor)")
 
-    out_transitions = transitions  # in-place OK since output is a new file
+    out_transitions = transitions
+
+    # If a reference PKL is provided, load transitions lazily per cam
+    ref_transitions_cache = None
+    if visual_ref_pkl:
+        try:
+            ref_transitions_cache = load_pkl(visual_ref_pkl)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load --visual_ref_pkl={visual_ref_pkl}: {e}")
+        if not isinstance(ref_transitions_cache, list):
+            raise TypeError(f"{visual_ref_pkl} does not contain a list")
 
     for cam in camera_keys:
         frames = extract_camera_frames(out_transitions, cam, device='cpu')
 
-        # Optional: launch UI to collect exemplar boxes (per prompt, per selected frame)
-        visual_prompts: Optional[Dict[str, Dict[int, List[Dict[str, Any]]]]] = None
-        if prompt_mode == "text_visual":
-            from sam3_box_prompt_ui import Sam3BoxPromptUI
+        # Visual prompts: one JSON file for the whole run. If a ref pkl is provided,
+        # we will collect prompts on that file (once) and reuse for all other files.
+        visual_prompts = None
+        if prompt_mode == 'text_visual':
+            if vp_store is None:
+                raise RuntimeError('vp_store is required when prompt_mode=text_visual')
 
-            vp_dir = visual_prompts_dir or os.path.join(out_root, "visual_prompts")
-            os.makedirs(vp_dir, exist_ok=True)
-            vp_path = os.path.join(vp_dir, f"{base}_{cam}_visual_prompts.json")
+            cur_key = vp_store.make_key(pkl_path, cam)
+            ref_key = vp_store.make_key(visual_ref_pkl, cam) if visual_ref_pkl else None
 
-            if (not overwrite_visual_prompts) and os.path.exists(vp_path):
-                with open(vp_path, "r") as f:
-                    visual_prompts = json.load(f)
-                print(f"[visual prompts] loaded: {vp_path}")
+            if (not overwrite_visual_prompts) and vp_store.has(cur_key):
+                visual_prompts = vp_store.get(cur_key)
+                print(f"[visual prompts] using existing for this file: {cur_key}")
+            elif ref_key and (not overwrite_visual_prompts) and vp_store.has(ref_key):
+                visual_prompts = vp_store.get(ref_key)
+                print(f"[visual prompts] using reference prompts from: {ref_key}")
             else:
-                # If not provided, default to frame 0.
+                from sam3_box_prompt_ui import Sam3BoxPromptUI
+
+                # choose frames source for UI
+                if visual_ref_pkl:
+                    ref_frames = extract_camera_frames(ref_transitions_cache, cam, device='cpu')
+                    src_frames = ref_frames
+                    src_name = os.path.splitext(os.path.basename(visual_ref_pkl))[0]
+                else:
+                    src_frames = frames
+                    src_name = base
+
                 idxs = list(ui_frame_indices) if ui_frame_indices else [0]
-                idxs = [int(i) for i in idxs if 0 <= int(i) < len(frames)]
-                if not idxs:
-                    idxs = [0]
+                idxs = clamp_frame_indices(idxs, len(src_frames))
 
                 ui = Sam3BoxPromptUI(
-                    frames_rgb_u8=frames,
+                    frames_rgb_u8=src_frames,
                     prompts=prompts,
                     frame_indices=idxs,
-                    window_name=f"SAM3 Visual Prompts | {base} | {cam}",
+                    window_name=f"SAM3 Visual Prompts | {src_name} | {cam}",
                 )
                 try:
-                    visual_prompts = ui.run()
+                    ann = ui.run()  # dict[prompt][frame_idx] -> list[{'xywh':..,'label':..}]
                 except KeyboardInterrupt:
-                    raise RuntimeError("Visual prompt UI aborted; no segmentation was run.")
+                    raise RuntimeError('Visual prompt UI aborted; no segmentation was run.')
 
-                with open(vp_path, "w") as f:
-                    json.dump(visual_prompts, f, indent=2)
-                print(f"[visual prompts] saved: {vp_path}")
+                # Save under ref_key if specified, else under cur_key
+                save_key = ref_key if ref_key else cur_key
+                vp_store.set(save_key, ann)
+                vp_store.save()
+                print(f"[visual prompts] saved to store key: {save_key}")
+
+                visual_prompts = ann
+
+                # If no ref file and we were labeling current file, nothing else needed.
 
         # 1) Save original video BEFORE segmentation
         orig_mp4 = os.path.join(video_dir, f"{base}_{cam}_orig.mp4")
         if overwrite_videos or not os.path.exists(orig_mp4):
             write_video(frames, orig_mp4, fps=fps)
 
-        # frames = extract_camera_frames(out_transitions, cam)
-                # 2) Segment
+        # 2) Segment
         if use_video_predictor:
             tmp_root = os.path.join(out_root, "_tmp_frames", f"{base}_{cam}")
-
             masks_u8 = segment_video_predictor_num_chunks(
                 video_predictor=video_predictor,
                 frames_rgb_u8=frames,
@@ -996,7 +1134,7 @@ def process_one_pkl(
                 score_thresh=score_thresh,
                 num_chunks=num_chunks,
                 overlap=chunk_overlap,
-                anchor_freq=anchor_freq,          # optional re-anchoring
+                anchor_freq=anchor_freq,
             )
         else:
             masks_u8 = sam3_segmenter.segment_frames_microbatched(
@@ -1025,6 +1163,7 @@ def process_one_pkl(
     if overwrite_pkls or not os.path.exists(out_pkl):
         save_pkl(out_transitions, out_pkl)
 
+
 def process_pkl_dir_batched(
     src_dir: str,
     out_root: str,
@@ -1035,10 +1174,11 @@ def process_pkl_dir_batched(
     overwrite_pkls: bool = False,
     use_video_predictor: bool = False,
     score_thresh: float = 0.0,
-    prompt_mode: str = "text_only",
+    prompt_mode: str = 'text_only',
     ui_frame_indices: Optional[List[int]] = None,
     visual_prompts_dir: Optional[str] = None,
     overwrite_visual_prompts: bool = False,
+    visual_ref_pkl: Optional[str] = None,
     device: str = "cuda",
     div_num_idx: int = 1,
     div_start_idx: int = 0,
@@ -1060,11 +1200,30 @@ def process_pkl_dir_batched(
         end = n
     pkl_paths = pkl_paths[start:end]
 
+    # resolve visual_ref_pkl if provided (allow relative path within src_dir)
+    ref_pkl = None
+    if visual_ref_pkl:
+        ref_pkl = visual_ref_pkl
+        if not os.path.isabs(ref_pkl):
+            cand = os.path.join(src_dir, ref_pkl)
+            if os.path.exists(cand):
+                ref_pkl = cand
+        if not os.path.exists(ref_pkl):
+            raise FileNotFoundError(f"--visual_ref_pkl not found: {ref_pkl}")
+
     # build SAM3 ONCE
     sam3_segmenter = Sam3ImageSegmenter(device=device)
     video_predictor = None
     if use_video_predictor:
         video_predictor = build_sam3_video_predictor()
+
+    vp_store = None
+    if (prompt_mode == 'text_visual') and (not use_video_predictor):
+        vp_dir = visual_prompts_dir or os.path.join(out_root, 'visual_prompts')
+        os.makedirs(vp_dir, exist_ok=True)
+        vp_json = os.path.join(vp_dir, 'visual_prompts.json')
+        vp_store = VisualPromptStore(vp_json)
+        print(f"[visual prompts] store: {vp_json}")
 
     for pkl_path in tqdm(pkl_paths, desc="PKLs", unit="file"):
         process_one_pkl(
@@ -1081,7 +1240,9 @@ def process_pkl_dir_batched(
             ui_frame_indices=ui_frame_indices,
             visual_prompts_dir=visual_prompts_dir,
             overwrite_visual_prompts=overwrite_visual_prompts,
-            sam3_segmenter=sam3_segmenter,   # reuse
+            visual_ref_pkl=ref_pkl,
+            vp_store=vp_store,
+            sam3_segmenter=sam3_segmenter,
             batch_size=batch_size,
             video_predictor=video_predictor,
             num_chunks=num_chunks,
@@ -1089,73 +1250,57 @@ def process_pkl_dir_batched(
             anchor_freq=anchor_freq,
         )
 
+
 def main():
     ap = argparse.ArgumentParser()
-    # ap.add_argument("--input", default="/home/agiuser/experiments" # red block|block stand with hole|red block in block stand|block stand filled by red block
-    #                                             "/hil_serl_LOGS/pretraining/" \
-    #                                             "camera_pos_metacond_awac_pretrain_randomZ/" \
-    #                                             "pos1/online_buffer", help="A transitions_*.pkl file OR a directory containing transitions_*.pkl files.")
-    ap.add_argument("--input", default="/home/agiuser/experiments/hil_serl_LOGS/" \
-                                        "pretraining/camera_pos_metacond_sac_pretrain_randomZ"
-                                        "/pos0/online_buffer"
+    ap.add_argument("--input", default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/" \
+                                        "single_arm_insert_mc_returns/pretraining_tasks/camera_pos0_sac_pretrain_randomZ/" \
+                                        "precision_data_yangyang"
                                         , help="A transitions_*.pkl file OR a directory containing transitions_*.pkl files.")
-    
+
     ap.add_argument("--commit", default="seg", help="Suffix for output dir name: <input>_sam3_<commit>")
     ap.add_argument("--prompt", required=True, help='Text prompt for SAM3. Use "|" to union prompts, e.g. "peg|hole".')
     ap.add_argument("--camera_keys", default="wrist_1,wrist_2", help="Comma-separated camera keys to segment.")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--overwrite_videos", default=True,action="store_true")
-    ap.add_argument("--overwrite_pkls", default=True,action="store_true")
+    ap.add_argument("--overwrite_videos", action="store_true", default=True)
+    ap.add_argument("--overwrite_pkls", action="store_true", default=True)
     ap.add_argument("--use_video_predictor", action="store_true",
-                    help="Try SAM3 video_predictor first (single prompt only). Falls back to image-per-frame if needed.")
+                    help="Try SAM3 video_predictor first (single prompt only).")
 
-    # Prompting mode
-    ap.add_argument(
-        "--prompt_mode",
-        type=str,
-        default="text_only",
-        choices=["text_only", "text_visual"],
-        help="text_only: current behavior. text_visual: launch a UI to add positive/negative exemplar boxes per prompt (image-per-frame only).",
-    )
-    ap.add_argument(
-        "--ui_frames",
-        type=str,
-        default="0",
-        help="Frames to annotate in the visual UI (only used when --prompt_mode text_visual). Example: '0,10,20' or '0-100:5'.",
-    )
-    ap.add_argument(
-        "--visual_prompts_dir",
-        type=str,
-        default="",
-        help="Where to save/load per-(pkl,cam) visual prompt JSONs (default: <out_root>/visual_prompts)",
-    )
-    ap.add_argument(
-        "--overwrite_visual_prompts",
-        action="store_true",
-        help="If set, always launch the UI and overwrite the saved visual prompt JSON.",
-    )
     ap.add_argument("--score_thresh", type=float, default=0.0,
                     help="If SAM3 returns multiple masks with scores, union only masks with score >= this.")
-    ap.add_argument("--start_idx", type=int, default=0, help="Shard start index (like your roboengine script).")
-    ap.add_argument("--div_num_idx", type=int, default=1, help="Shard count (like your roboengine script).")
+
+    # Visual prompting
+    ap.add_argument("--prompt_mode", choices=["text_only", "text_visual"], default="text_only",
+                    help="text_only: current behavior. text_visual: UI for positive/negative exemplar boxes (image mode only).")
+    ap.add_argument("--ui_frames", type=str, default="0",
+                    help="Frames to annotate in the UI. e.g. '0,10,20' or '0-100:5' or '0:100:5'")
+    ap.add_argument("--visual_prompts_dir", type=str, default="",
+                    help="Folder containing visual_prompts.json (default: <out_root>/visual_prompts)")
+    ap.add_argument("--overwrite_visual_prompts", action="store_true",
+                    help="Re-run the UI and overwrite stored prompts.")
+    ap.add_argument("--visual_ref_pkl", type=str, default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/" \
+                                                            "single_arm_insert_mc_returns/pretraining_tasks/" \
+                                                            "camera_pos0_sac_pretrain_randomZ/precision_data_yangyang/transitions_5000.pkl",
+                    help="If set, the UI reference frames are taken from this PKL, and its prompts are reused for other PKLs.")
+
+    ap.add_argument("--start_idx", type=int, default=0, help="Shard start index.")
+    ap.add_argument("--div_num_idx", type=int, default=1, help="Shard count.")
     ap.add_argument("--device", type=str, default="cuda", help="which compute device to use")
-    ap.add_argument("--batch_size", type=str, default=1024, help="segmnentationb batch size")
+    ap.add_argument("--batch_size", type=int, default=1024, help="segmentation batch size")
     ap.add_argument("--num_chunks", type=int, default=1)
     ap.add_argument("--chunk_overlap", type=int, default=16)
     ap.add_argument("--anchor_freq", type=int, default=0)
-    
 
     args = ap.parse_args()
 
     src_dir = os.path.abspath(args.input.rstrip(os.sep))
-    out_root = f"{args.input.rstrip(os.sep)}_sam3_{args.commit}" if os.path.isdir(args.input) else \
-               os.path.join(os.path.dirname(args.input), f"_sam3_{args.commit}")
+    out_root = f"{args.input.rstrip(os.sep)}_sam3_{args.commit}" if os.path.isdir(args.input) else                os.path.join(os.path.dirname(args.input), f"_sam3_{args.commit}")
     os.makedirs(out_root, exist_ok=True)
 
-    camera_keys = [c.strip() for c in args.camera_keys.split(",") if c.strip()]
+    camera_keys = [c.strip() for c in args.camera_keys.split(',') if c.strip()]
 
-    ui_frame_indices = parse_frame_indices(args.ui_frames)
-    visual_prompts_dir = args.visual_prompts_dir.strip() or None
+    ui_frame_indices = parse_ui_frames(args.ui_frames)
 
     process_pkl_dir_batched(
         src_dir=src_dir,
@@ -1169,8 +1314,9 @@ def main():
         score_thresh=args.score_thresh,
         prompt_mode=args.prompt_mode,
         ui_frame_indices=ui_frame_indices,
-        visual_prompts_dir=visual_prompts_dir,
+        visual_prompts_dir=(args.visual_prompts_dir or None),
         overwrite_visual_prompts=args.overwrite_visual_prompts,
+        visual_ref_pkl=(args.visual_ref_pkl or None),
         device=args.device,
         div_num_idx=args.div_num_idx,
         div_start_idx=args.start_idx,
@@ -1183,3 +1329,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+#ap.add_argument("--input", default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/" \
+                                        # "single_arm_insert_mc_returns/pretraining_tasks/camera_pos0_sac_pretrain_randomZ/" \
+                                        # "precision_data_yangyang"
+                                        # , help="A transitions_*.pkl file OR a directory containing transitions_*.pkl files.")
+
+# CUDA_VISIBLE_DEVICES=0 python sam3_segment_transitions_dual_mode.py --prompt_mode text_visual  --prompt "red block|block stand with hole|red block in block stand|block stand filled by red block" --commit peg_hole --ui_frames "0,300,700, 800"
+# CUDA_VISIBLE_DEVICES=0 python sam3_segment_transitions_dual_mode.py --prompt_mode text_visual  --prompt "grey connector on red stand|white block with grey tip|white block with grey tip on red stand" --commit peg_hole --ui_frames "0,300,720, 9000"
