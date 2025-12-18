@@ -12,6 +12,7 @@ import numpy as np
 import imageio.v2 as imageio
 from PIL import Image
 import torch
+import inspect
 
 # SAM3 (per README)
 from sam3.model_builder import build_sam3_image_model, build_sam3_video_predictor
@@ -248,7 +249,17 @@ def choose_mask_from_output(output, h, w, score_thresh=0.0, fallback="zeros"):
 
     return m
 
-
+def _poly_to_mask_u8(poly_xy: List[List[float]], H: int, W: int) -> np.ndarray:
+    """poly_xy in ORIGINAL pixel coords -> uint8 mask (H,W) {0,255}."""
+    m = np.zeros((H, W), dtype=np.uint8)
+    pts = np.asarray(poly_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] != 2:
+        return m
+    pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
+    pts_i = pts.round().astype(np.int32).reshape(-1, 1, 2)
+    cv2.fillPoly(m, [pts_i], 255)
+    return m
 class Sam3ImageSegmenter:
     def __init__(self, device="cuda", use_amp=True):
         self.device = device
@@ -257,6 +268,66 @@ class Sam3ImageSegmenter:
         model = build_sam3_image_model()
         model = model.to(device).eval()
         self.processor = Sam3Processor(model)
+        self._mask_api = None  # lazily resolved
+    def _resolve_mask_api(self):
+        """Figure out how to pass a mask prompt into your installed SAM3 Processor."""
+        proc = self.processor
+        if hasattr(proc, "add_geometric_prompt"):
+            sig = inspect.signature(proc.add_geometric_prompt)
+            params = set(sig.parameters.keys())
+            if "mask" in params:
+                return ("add_geometric_prompt", "mask")
+            if "masks" in params:
+                return ("add_geometric_prompt", "masks")
+        for name in ("add_mask_prompt", "set_mask_prompt", "add_visual_prompt_mask"):
+            if hasattr(proc, name):
+                return (name, None)
+        return None
+
+    def _add_mask_prompt(self, state, mask_u8: np.ndarray, label: bool):
+        """
+        Adds a POS/NEG exemplar mask prompt.
+        mask_u8: (H,W) uint8 {0,255} or {0,1}
+        """
+        if self._mask_api is None:
+            self._mask_api = self._resolve_mask_api()
+
+        # Fallback if API not found: approximate with bbox so it still helps.
+        if self._mask_api is None:
+            ys, xs = np.where(mask_u8 > 0)
+            if xs.size == 0 or ys.size == 0:
+                return state
+            x0, x1 = xs.min(), xs.max()
+            y0, y1 = ys.min(), ys.max()
+            bw = float(x1 - x0 + 1)
+            bh = float(y1 - y0 + 1)
+            H, W = mask_u8.shape[:2]
+            cx = (x0 + x1) * 0.5 / float(W)
+            cy = (y0 + y1) * 0.5 / float(H)
+            nw = bw / float(W)
+            nh = bh / float(H)
+            norm_box = [float(cx), float(cy), float(nw), float(nh)]
+            return self.processor.add_geometric_prompt(state=state, box=norm_box, label=bool(label))
+
+        fn_name, param = self._mask_api
+        fn = getattr(self.processor, fn_name)
+
+        # SAM processors often accept numpy or torch; we send torch on device to be safe.
+        mask01 = (mask_u8 > 0).astype(np.uint8)  # 0/1
+        mask_t = torch.from_numpy(mask01).to(self.device)
+
+        if fn_name == "add_geometric_prompt":
+            if param == "mask":
+                return fn(state=state, mask=mask_t, label=bool(label))
+            if param == "masks":
+                return fn(state=state, masks=mask_t[None, ...], label=bool(label))
+            return state
+
+        # other APIs
+        try:
+            return fn(state=state, mask=mask_t, label=bool(label))
+        except TypeError:
+            return fn(state=state, mask=mask_t, label=bool(label))
     def segment_frames_microbatched(
         self,
         frames_rgb_u8: List[np.ndarray],
@@ -345,19 +416,32 @@ class Sam3ImageSegmenter:
                                 self.processor.reset_all_prompts(state)
                                 state = self.processor.set_text_prompt(state=state, prompt=p)
 
-                                boxes = _get_boxes(p, frame_idx)
-                                if boxes:
-                                    for b in boxes:
-                                        xywh = b.get("xywh") if isinstance(b, dict) else None
-                                        label = b.get("label") if isinstance(b, dict) else None
-                                        if xywh is None or label is None:
+                                items = _get_boxes(p, frame_idx)  # keep name if you want; it now returns boxes + polys
+                                if items:
+                                    for it in items:
+                                        if not isinstance(it, dict):
                                             continue
-                                        norm_box = _xywh_to_norm_cxcywh(xywh, W, H)
-                                        state = self.processor.add_geometric_prompt(
-                                            state=state,
-                                            box=norm_box,
-                                            label=bool(label),
-                                        )
+
+                                        label = bool(it.get("label", True))
+
+                                        # BOX item (backward compatible)
+                                        xywh = it.get("xywh", None)
+                                        if xywh is not None:
+                                            norm_box = _xywh_to_norm_cxcywh(xywh, W, H)
+                                            state = self.processor.add_geometric_prompt(
+                                                state=state,
+                                                box=norm_box,
+                                                label=label,
+                                            )
+                                            continue
+
+                                        # LASSO/POLY item -> mask prompt
+                                        poly = it.get("poly", None)
+                                        if poly is not None:
+                                            mask_u8 = _poly_to_mask_u8(poly, H, W)
+                                            state = self._add_mask_prompt(state=state, mask_u8=mask_u8, label=label)
+                                            continue
+
 
                                 m = choose_mask_from_output(
                                     state, h=H, w=W, score_thresh=score_thresh, fallback="zeros"
@@ -1028,6 +1112,7 @@ def process_one_pkl(
     num_chunks=4,
     chunk_overlap=8,
     anchor_freq=32,
+    ui_tool="box",
 ):
     transitions = load_pkl(pkl_path)
     if not isinstance(transitions, list):
@@ -1102,6 +1187,7 @@ def process_one_pkl(
                     prompts=prompts,
                     frame_indices=idxs,
                     window_name=f"SAM3 Visual Prompts | {src_name} | {cam}",
+                    ui_tool=ui_tool
                 )
                 try:
                     ann = ui.run()  # dict[prompt][frame_idx] -> list[{'xywh':..,'label':..}]
@@ -1186,6 +1272,7 @@ def process_pkl_dir_batched(
     num_chunks=4,
     chunk_overlap=8,
     anchor_freq=32,
+    ui_tool="box",
 ):
     pkl_paths = list_transition_pkls_batch(src_dir)
     if len(pkl_paths) == 0:
@@ -1248,14 +1335,13 @@ def process_pkl_dir_batched(
             num_chunks=num_chunks,
             chunk_overlap=chunk_overlap,
             anchor_freq=anchor_freq,
+            ui_tool=ui_tool,
         )
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/" \
-                                        "single_arm_insert_mc_returns/pretraining_tasks/camera_pos0_sac_pretrain_randomZ/" \
-                                        "precision_data_yangyang"
+    ap.add_argument("--input", default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/single_arm_insert_mc_returns/pretraining_tasks/lidong_g2_data/demo_buffer"
                                         , help="A transitions_*.pkl file OR a directory containing transitions_*.pkl files.")
 
     ap.add_argument("--commit", default="seg", help="Suffix for output dir name: <input>_sam3_<commit>")
@@ -1279,9 +1365,8 @@ def main():
                     help="Folder containing visual_prompts.json (default: <out_root>/visual_prompts)")
     ap.add_argument("--overwrite_visual_prompts", action="store_true",
                     help="Re-run the UI and overwrite stored prompts.")
-    ap.add_argument("--visual_ref_pkl", type=str, default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/" \
-                                                            "single_arm_insert_mc_returns/pretraining_tasks/" \
-                                                            "camera_pos0_sac_pretrain_randomZ/precision_data_yangyang/transitions_5000.pkl",
+    ap.add_argument("--visual_ref_pkl", type=str, default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/single_arm_insert_mc_returns/pretraining_tasks/lidong_g2_data/demo_buffer/" \
+                                                            "transitions_1000.pkl",
                     help="If set, the UI reference frames are taken from this PKL, and its prompts are reused for other PKLs.")
 
     ap.add_argument("--start_idx", type=int, default=0, help="Shard start index.")
@@ -1291,6 +1376,12 @@ def main():
     ap.add_argument("--num_chunks", type=int, default=1)
     ap.add_argument("--chunk_overlap", type=int, default=16)
     ap.add_argument("--anchor_freq", type=int, default=0)
+    ap.add_argument(
+        "--ui_tool",
+        choices=["box", "lasso", "both"],
+        default="box",
+        help="Visual prompt tool: box=drag rectangle, lasso=freehand draw, both=allow toggling with 'm'.",
+    )
 
     args = ap.parse_args()
 
@@ -1324,6 +1415,7 @@ def main():
         num_chunks=args.num_chunks,
         chunk_overlap=args.chunk_overlap,
         anchor_freq=args.anchor_freq,
+        ui_tool=args.ui_tool,
     )
 
 
@@ -1340,3 +1432,10 @@ if __name__ == "__main__":
 
 # CUDA_VISIBLE_DEVICES=0 python sam3_segment_transitions_dual_mode.py --prompt_mode text_visual  --prompt "red block|block stand with hole|red block in block stand|block stand filled by red block" --commit peg_hole --ui_frames "0,300,700, 800"
 # CUDA_VISIBLE_DEVICES=0 python sam3_segment_transitions_dual_mode.py --prompt_mode text_visual  --prompt "grey connector on red stand|white block with grey tip|white block with grey tip on red stand" --commit peg_hole --ui_frames "0,300,720, 9000"
+
+# for longqi task
+# ap.add_argument("--input", default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/single_arm_insert_mc_returns/pretraining_tasks/lidong_g2_data/demo_buffer"
+                                        # , help="A transitions_*.pkl file OR a directory containing transitions_*.pkl files.")
+# ap.add_argument("--visual_ref_pkl", type=str, default="/home/agiuser/experiments/hil-serl_LOGS/pretraining/log_metrics/single_arm_insert_mc_returns/pretraining_tasks/lidong_g2_data/demo_buffer/" \
+                    #                                         "transitions_1000.pkl",
+                    # help="If set, the UI reference frames are taken from this PKL, and its prompts are reused for other PKLs.")
